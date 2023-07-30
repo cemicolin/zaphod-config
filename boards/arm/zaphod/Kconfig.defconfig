@@ -78,4 +78,6 @@ config ZMK_USB
 config ZMK_BATTERY_VOLTAGE_DIVIDER
 	default y
 
+CONFIG_ZAPHOD_BONGO_CAT=y
+
 endif # BOARD_ZAPHOD
