@@ -4,7 +4,9 @@
 #   .\build-local.ps1            # build, output in .\firmware\zaphod.uf2
 #   .\build-local.ps1 -Flash     # build, then copy to the keyboard's bootloader drive
 #
-# Same behaviour as build-local.sh; see docs/setup-windows.md.
+# UNTESTED: this script has not been run on Windows yet. It is a simpler port
+# of build-local.sh (it keeps the ZMK workspace in a Docker volume and does
+# not force a clean rebuild when config changes). See docs/setup-windows.md.
 
 param(
     [switch]$Flash,
