@@ -6,14 +6,14 @@
  * Sharp memory LCD driver for the Zaphod, based on Zephyr's
  * drivers/display/ls0xx.c (which is turned off with CONFIG_LS0XX=n).
  *
- * Two differences from the Zephyr driver:
+ * Three differences from the Zephyr driver:
  *
  * - VCOM is toggled in software. The panel needs the polarity of its common
  *   electrode flipped about once a second, or the liquid crystal sees a DC
  *   voltage and pixels ghost, flicker and eventually burn in. Zephyr only
  *   does this through the EXTCOMIN pin, which the Zaphod doesn't connect, so
  *   here every command carries the VCOM bit and a timer sends a "hold"
- *   command that flips it twice a second.
+ *   command that flips it about twice a second.
  * - Chip select gets a setup/hold delay. The panel wants 6 us between CS
  *   rising and the first clock, and 2 us after the last; Zephyr uses 0.
  * - Updates are held back until the keys have been quiet for a moment. Rows
@@ -21,7 +21,8 @@
  *   (the display hangs off pogo pins, and the panel can't be read back to
  *   check), which left a stray row above the layer name after every layer
  *   change. The driver keeps its own copy of the screen, and sends the rows
- *   that changed once no key has moved for LS0XX_KEY_QUIET_MS.
+ *   that changed once no key has moved for LS0XX_KEY_QUIET_MS. The VCOM
+ *   command waits for quiet keys too.
  */
 
 #define DT_DRV_COMPAT sharp_ls0xx
@@ -63,6 +64,8 @@ LOG_MODULE_REGISTER(zaphod_ls0xx, CONFIG_DISPLAY_LOG_LEVEL);
 
 /* Flip VCOM this often: a 1 Hz square wave, the panel's typical rate. */
 #define LS0XX_VCOM_TOGGLE_MS 500
+/* While someone types the flip waits for quiet keys, but never longer than this. */
+#define LS0XX_VCOM_MAX_MS 2000
 
 /* Send changed rows only once no key has moved for this long... */
 #define LS0XX_KEY_QUIET_MS 120
@@ -80,9 +83,10 @@ struct ls0xx_config {
 #endif
 };
 
-/* One SPI transaction at a time: screen updates come from the display thread
- * and VCOM toggles from the system work queue. SPI_LOCK_ON doesn't keep them
- * apart because both use the same SPI config. */
+/* One SPI transaction at a time, and guards the shadow copy. LVGL draws from
+ * ZMK's display work queue; rows and VCOM commands are sent from the system
+ * work queue. SPI_LOCK_ON doesn't keep transactions apart because they all use
+ * the same SPI config. */
 static K_MUTEX_DEFINE(ls0xx_lock);
 static uint8_t ls0xx_vcom;
 static const struct device *ls0xx_dev;
@@ -92,9 +96,12 @@ static uint8_t ls0xx_shadow[LS0XX_PANEL_HEIGHT][LS0XX_PANEL_WIDTH / LS0XX_PIXELS
 /* Lines (numbered from 1) waiting to be sent; first == 0 means none. */
 static uint16_t ls0xx_dirty_first;
 static uint16_t ls0xx_dirty_last;
-/* Uptime when the oldest waiting line was drawn, and when a key last moved. */
-static int64_t ls0xx_dirty_since;
-static int64_t ls0xx_last_key;
+/* Uptime (ms) when the oldest waiting line was drawn, when a key last moved
+ * and when VCOM last flipped. 32 bits, so reads and writes are atomic; the
+ * differences below stay correct when the counter wraps. */
+static uint32_t ls0xx_dirty_since;
+static uint32_t ls0xx_last_key;
+static uint32_t ls0xx_last_vcom;
 
 static int ls0xx_blanking_off(const struct device *dev) {
 #if DT_INST_NODE_HAS_PROP(0, disp_en_gpios)
@@ -143,11 +150,24 @@ static void ls0xx_vcom_work_cb(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(ls0xx_vcom_work, ls0xx_vcom_work_cb);
 
 static void ls0xx_vcom_work_cb(struct k_work *work) {
+    uint32_t now = k_uptime_get_32();
+    uint32_t quiet_for = now - ls0xx_last_key;
+    int err;
+
+    if (quiet_for < LS0XX_KEY_QUIET_MS && now - ls0xx_last_vcom < LS0XX_VCOM_MAX_MS) {
+        k_work_schedule(&ls0xx_vcom_work, K_MSEC(LS0XX_KEY_QUIET_MS - quiet_for));
+        return;
+    }
+
     k_mutex_lock(&ls0xx_lock, K_FOREVER);
     ls0xx_vcom ^= LS0XX_BIT_VCOM;
     k_mutex_unlock(&ls0xx_lock);
 
-    ls0xx_short_cmd(ls0xx_dev, 0);
+    err = ls0xx_short_cmd(ls0xx_dev, 0);
+    if (err) {
+        LOG_ERR("VCOM command failed: %d", err);
+    }
+    ls0xx_last_vcom = now;
     k_work_schedule(&ls0xx_vcom_work, K_MSEC(LS0XX_VCOM_TOGGLE_MS));
 }
 
@@ -202,8 +222,9 @@ static void ls0xx_flush_work_cb(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(ls0xx_flush_work, ls0xx_flush_work_cb);
 
 static void ls0xx_flush_work_cb(struct k_work *work) {
-    int64_t now = k_uptime_get();
-    int64_t quiet_for = now - ls0xx_last_key;
+    uint32_t now = k_uptime_get_32();
+    uint32_t quiet_for = now - ls0xx_last_key;
+    int err;
 
     if (quiet_for < LS0XX_KEY_QUIET_MS && now - ls0xx_dirty_since < LS0XX_MAX_HOLD_MS) {
         k_work_schedule(&ls0xx_flush_work, K_MSEC(LS0XX_KEY_QUIET_MS - quiet_for));
@@ -212,7 +233,11 @@ static void ls0xx_flush_work_cb(struct k_work *work) {
 
     k_mutex_lock(&ls0xx_lock, K_FOREVER);
     if (ls0xx_dirty_first != 0) {
-        ls0xx_send_lines(ls0xx_dev, ls0xx_dirty_first, ls0xx_dirty_last - ls0xx_dirty_first + 1);
+        err = ls0xx_send_lines(ls0xx_dev, ls0xx_dirty_first,
+                               ls0xx_dirty_last - ls0xx_dirty_first + 1);
+        if (err) {
+            LOG_ERR("Sending lines %d to %d failed: %d", ls0xx_dirty_first, ls0xx_dirty_last, err);
+        }
         ls0xx_dirty_first = 0;
     }
     k_mutex_unlock(&ls0xx_lock);
@@ -228,7 +253,7 @@ static int ls0xx_update_display(const struct device *dev, uint16_t start_line, u
     if (ls0xx_dirty_first == 0) {
         ls0xx_dirty_first = start_line;
         ls0xx_dirty_last = last_line;
-        ls0xx_dirty_since = k_uptime_get();
+        ls0xx_dirty_since = k_uptime_get_32();
     } else {
         ls0xx_dirty_first = MIN(ls0xx_dirty_first, start_line);
         ls0xx_dirty_last = MAX(ls0xx_dirty_last, last_line);
@@ -243,7 +268,7 @@ static int ls0xx_update_display(const struct device *dev, uint16_t start_line, u
 }
 
 static int ls0xx_key_listener(const zmk_event_t *eh) {
-    ls0xx_last_key = k_uptime_get();
+    ls0xx_last_key = k_uptime_get_32();
     return ZMK_EV_EVENT_BUBBLE;
 }
 
