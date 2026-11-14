@@ -1,5 +1,8 @@
 # Building and flashing on Windows
 
+> **Untested.** These steps and `build-local.ps1` have not been run on Windows
+> yet. The Mac guide and `build-local.sh` are the tested path.
+
 You do this setup once. Afterwards a firmware update is one command.
 
 ## 1. Install the tools
